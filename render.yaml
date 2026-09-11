@@ -30,9 +30,9 @@ services:
       - key: SMTP_PASSWORD
         sync: false
       - key: FRONTEND_URL
-        sync: false
+        value: https://ai-hr-recruitment-portal-1.onrender.com
       - key: FRONTEND_ORIGINS
-        sync: false
+        value: https://ai-hr-recruitment-portal-1.onrender.com
 
   - type: web
     name: ai-recruitment-frontend
@@ -42,4 +42,4 @@ services:
     staticPublishPath: dist
     envVars:
       - key: VITE_API_URL
-        sync: false
+        value: https://ai-recruitment-api.onrender.com
