@@ -13,7 +13,10 @@ from fastapi import (
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
-from Backend.database import close_db_pool
+from Backend.database import (
+    get_db_connection,
+    close_db_pool,
+)
 
 from Backend.resume import process_resume
 from Backend.job import create_job
@@ -67,7 +70,9 @@ def get_logged_in_user(
     credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
     try:
-        return get_current_user(credentials.credentials)
+        return get_current_user(
+            credentials.credentials
+        )
 
     except ValueError as error:
         raise HTTPException(
@@ -104,13 +109,17 @@ class LoginRequest(BaseModel):
 def home():
     return {
         "message": "AI Recruitment Portal Backend is running",
-        "groq_configured": bool(os.getenv("GROQ_API_KEY")),
+        "groq_configured": bool(
+            os.getenv("GROQ_API_KEY")
+        ),
     }
 
 
 @app.get("/api/groq/status")
 def groq_status():
-    api_key_set = bool(os.getenv("GROQ_API_KEY"))
+    api_key_set = bool(
+        os.getenv("GROQ_API_KEY")
+    )
 
     masked_key = ""
 
@@ -184,16 +193,54 @@ async def upload_resumes(
     files: list[UploadFile] = File(...),
     current_user=Depends(get_logged_in_user),
 ):
+    user_id = current_user["id"]
+
+    if not files:
+        raise HTTPException(
+            status_code=400,
+            detail="No files uploaded",
+        )
+
+    # -------------------------
+    # Create batch
+    # -------------------------
+
+    with get_db_connection() as connection:
+        batch = connection.execute(
+            """
+            INSERT INTO resume_batches
+            (
+                user_id,
+                total_files,
+                status
+            )
+            VALUES (%s, %s, %s)
+            RETURNING id
+            """,
+            (
+                user_id,
+                len(files),
+                "processing",
+            )
+        ).fetchone()
+
+        connection.commit()
+
+    batch_id = batch["id"]
+
     successful = []
     failed = []
 
-    user_id = current_user["id"]
+    # -------------------------
+    # Process one resume
+    # -------------------------
 
     def process_single_resume(file):
         try:
             result = process_resume(
                 file,
                 user_id,
+                batch_id,
             )
 
             return {
@@ -209,11 +256,19 @@ async def upload_resumes(
                 "error": str(error),
             }
 
-    # Process at most 5 resumes concurrently
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    # -------------------------
+    # Process resumes concurrently
+    # -------------------------
+
+    with ThreadPoolExecutor(
+        max_workers=5
+    ) as executor:
 
         futures = [
-            executor.submit(process_single_resume, file)
+            executor.submit(
+                process_single_resume,
+                file
+            )
             for file in files
         ]
 
@@ -231,10 +286,62 @@ async def upload_resumes(
                     "error": result["error"],
                 })
 
+            # -------------------------
+            # Update batch progress
+            # -------------------------
+
+            with get_db_connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE resume_batches
+                    SET
+                        processed_files = processed_files + 1,
+                        successful_files = successful_files
+                            + %s,
+                        failed_files = failed_files
+                            + %s
+                    WHERE id = %s
+                      AND user_id = %s
+                    """,
+                    (
+                        1 if result["success"] else 0,
+                        0 if result["success"] else 1,
+                        batch_id,
+                        user_id,
+                    )
+                )
+
+                connection.commit()
+
+    # -------------------------
+    # Mark batch completed
+    # -------------------------
+
+    with get_db_connection() as connection:
+        connection.execute(
+            """
+            UPDATE resume_batches
+            SET
+                status = %s,
+                completed_at = NOW()
+            WHERE id = %s
+              AND user_id = %s
+            """,
+            (
+                "completed",
+                batch_id,
+                user_id,
+            )
+        )
+
+        connection.commit()
+
     return {
+        "batch_id": batch_id,
         "total_uploaded": len(files),
         "successful_resumes": successful,
         "failed_resumes": failed,
+        "status": "completed",
     }
 
 
